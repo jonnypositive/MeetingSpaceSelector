@@ -1493,10 +1493,21 @@ class AppHandler(BaseHTTPRequestHandler):
 
         self._json({"error": "Not found"}, status=404)
 
+    def do_HEAD(self) -> None:
+        parsed = urlparse(self.path)
+        if parsed.path == "/":
+            self.send_response(200)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.end_headers()
+            return
+        self.send_response(404)
+        self.end_headers()
+
     def do_POST(self) -> None:
         try:
             parsed = urlparse(self.path)
             if parsed.path != "/api/parse-rfp":
+                self._log(f"POST {parsed.path} rejected: not found")
                 self._json({"error": "Not found"}, status=404)
                 return
 
@@ -1507,32 +1518,38 @@ class AppHandler(BaseHTTPRequestHandler):
             )
 
             if "multipart/form-data" not in (self.headers.get("Content-Type", "")):
+                self._log("POST /api/parse-rfp rejected: content type is not multipart/form-data")
                 self._json({"error": "Expected multipart/form-data"}, status=400)
                 return
 
             fields = self._multipart_fields()
             if not fields:
+                self._log("POST /api/parse-rfp rejected: multipart parsing returned no fields")
                 self._json({"error": "Invalid multipart/form-data payload"}, status=400)
                 return
 
             filefield = fields.get("rfp")
             if filefield is None:
+                self._log("POST /api/parse-rfp rejected: missing 'rfp' field")
                 self._json({"error": "Missing RFP file upload"}, status=400)
                 return
             diaryfield = fields.get("diary")
 
             pdf_bytes = filefield.get("data", b"")
             if not pdf_bytes:
+                self._log("POST /api/parse-rfp rejected: uploaded rfp file is empty")
                 self._json({"error": "Uploaded file was empty"}, status=400)
                 return
 
             try:
                 text = extract_pdf_text(pdf_bytes)
             except RuntimeError as err:
+                self._log(f"POST /api/parse-rfp rejected: PDF extraction failed ({err})")
                 self._json({"error": str(err)}, status=500)
                 return
 
             if not looks_like_cvent_rfp(text):
+                self._log("POST /api/parse-rfp rejected: parsed text does not match expected Cvent RFP format")
                 self._json(
                     {
                         "error": "This does not look like a Cvent RFP format. Phase 1 is limited to Cvent templates.",
@@ -1574,6 +1591,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self._json(
                 LAST_REPORT
             )
+            self._log("POST /api/parse-rfp success: recommendations generated")
         except Exception as err:
             self._log(f"Unhandled upload exception: {err}")
             self._log(traceback.format_exc())
