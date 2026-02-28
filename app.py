@@ -1,5 +1,4 @@
 #!/usr/bin/env python3
-import cgi
 import datetime as dt
 import io
 import json
@@ -7,6 +6,8 @@ import math
 import os
 import re
 import html
+from email import policy
+from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1367,6 +1368,33 @@ def html_template() -> str:
 
 
 class AppHandler(BaseHTTPRequestHandler):
+    def _multipart_fields(self) -> Dict[str, Dict[str, Any]]:
+        content_type = self.headers.get("Content-Type", "")
+        content_length = int(self.headers.get("Content-Length", "0") or "0")
+        if "multipart/form-data" not in content_type or content_length <= 0:
+            return {}
+
+        body = self.rfile.read(content_length)
+        raw = (
+            f"Content-Type: {content_type}\r\n"
+            "MIME-Version: 1.0\r\n"
+            "\r\n"
+        ).encode("utf-8") + body
+        message = BytesParser(policy=policy.default).parsebytes(raw)
+        if not message.is_multipart():
+            return {}
+
+        fields: Dict[str, Dict[str, Any]] = {}
+        for part in message.iter_parts():
+            name = part.get_param("name", header="content-disposition")
+            if not name:
+                continue
+            fields[name] = {
+                "filename": part.get_filename() or "",
+                "data": part.get_payload(decode=True) or b"",
+            }
+        return fields
+
     def _file(self, path: Path, content_type: str) -> None:
         if not path.exists() or not path.is_file():
             self._json({"error": "Not found"}, status=404)
@@ -1441,27 +1469,22 @@ class AppHandler(BaseHTTPRequestHandler):
             self._json({"error": "Not found"}, status=404)
             return
 
-        ctype, pdict = cgi.parse_header(self.headers.get("Content-Type", ""))
-        if ctype != "multipart/form-data":
+        if "multipart/form-data" not in (self.headers.get("Content-Type", "")):
             self._json({"error": "Expected multipart/form-data"}, status=400)
             return
 
-        form = cgi.FieldStorage(
-            fp=self.rfile,
-            headers=self.headers,
-            environ={
-                "REQUEST_METHOD": "POST",
-                "CONTENT_TYPE": self.headers.get("Content-Type"),
-            },
-        )
+        fields = self._multipart_fields()
+        if not fields:
+            self._json({"error": "Invalid multipart/form-data payload"}, status=400)
+            return
 
-        filefield = form["rfp"] if "rfp" in form else None
-        if filefield is None or not getattr(filefield, "file", None):
+        filefield = fields.get("rfp")
+        if filefield is None:
             self._json({"error": "Missing RFP file upload"}, status=400)
             return
-        diaryfield = form["diary"] if "diary" in form else None
+        diaryfield = fields.get("diary")
 
-        pdf_bytes = filefield.file.read()
+        pdf_bytes = filefield.get("data", b"")
         if not pdf_bytes:
             self._json({"error": "Uploaded file was empty"}, status=400)
             return
@@ -1482,11 +1505,11 @@ class AppHandler(BaseHTTPRequestHandler):
             return
 
         diary_entries: List[Dict[str, Any]] = []
-        if diaryfield is not None and getattr(diaryfield, "file", None):
-            diary_bytes = diaryfield.file.read()
+        if diaryfield is not None:
+            diary_bytes = diaryfield.get("data", b"")
             if diary_bytes:
                 try:
-                    diary_entries = parse_diary_upload(diary_bytes, getattr(diaryfield, "filename", ""))
+                    diary_entries = parse_diary_upload(diary_bytes, diaryfield.get("filename", ""))
                 except RuntimeError:
                     diary_entries = []
 
