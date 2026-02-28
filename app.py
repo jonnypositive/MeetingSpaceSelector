@@ -6,8 +6,6 @@ import math
 import os
 import re
 import html
-from email import policy
-from email.parser import BytesParser
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1374,24 +1372,43 @@ class AppHandler(BaseHTTPRequestHandler):
         if "multipart/form-data" not in content_type or content_length <= 0:
             return {}
 
-        body = self.rfile.read(content_length)
-        raw = (
-            f"Content-Type: {content_type}\r\n"
-            "MIME-Version: 1.0\r\n"
-            "\r\n"
-        ).encode("utf-8") + body
-        message = BytesParser(policy=policy.default).parsebytes(raw)
-        if not message.is_multipart():
+        boundary_match = re.search(r'boundary=(?:"([^"]+)"|([^;]+))', content_type)
+        boundary_value = (boundary_match.group(1) or boundary_match.group(2)).strip() if boundary_match else ""
+        if not boundary_value:
             return {}
 
+        body = self.rfile.read(content_length)
+        delimiter = b"--" + boundary_value.encode("utf-8")
+        parts = body.split(delimiter)
         fields: Dict[str, Dict[str, Any]] = {}
-        for part in message.iter_parts():
-            name = part.get_param("name", header="content-disposition")
+        for part in parts[1:-1]:
+            chunk = part
+            if chunk.startswith(b"\r\n"):
+                chunk = chunk[2:]
+            if chunk.endswith(b"\r\n"):
+                chunk = chunk[:-2]
+            if not chunk:
+                continue
+            if b"\r\n\r\n" not in chunk:
+                continue
+            header_blob, data = chunk.split(b"\r\n\r\n", 1)
+            header_lines = header_blob.decode("utf-8", errors="ignore").split("\r\n")
+            header_map: Dict[str, str] = {}
+            for line in header_lines:
+                if ":" not in line:
+                    continue
+                key, value = line.split(":", 1)
+                header_map[key.strip().lower()] = value.strip()
+
+            disposition = header_map.get("content-disposition", "")
+            name_match = re.search(r'name="([^"]+)"', disposition)
+            filename_match = re.search(r'filename="([^"]*)"', disposition)
+            name = name_match.group(1) if name_match else ""
             if not name:
                 continue
             fields[name] = {
-                "filename": part.get_filename() or "",
-                "data": part.get_payload(decode=True) or b"",
+                "filename": filename_match.group(1) if filename_match else "",
+                "data": data,
             }
         return fields
 
