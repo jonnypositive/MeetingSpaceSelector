@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
 import cgi
 import datetime as dt
+import io
 import json
 import math
+import os
 import re
-import subprocess
-import tempfile
 import html
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+from pypdf import PdfReader
 
 ROOT = Path(__file__).resolve().parent
 ROOMS_PATH = ROOT / "room_catalog.json"
@@ -50,51 +51,20 @@ ROOMS = load_rooms()
 
 
 def extract_pdf_text(pdf_bytes: bytes) -> str:
-    with tempfile.TemporaryDirectory(prefix="polaris-pdf-") as td:
-        pdf_path = Path(td) / "upload.pdf"
-        swift_path = Path(td) / "extract.swift"
-        pdf_path.write_bytes(pdf_bytes)
-        swift_path.write_text(
-            """
-import Foundation
-import PDFKit
+    try:
+        reader = PdfReader(io.BytesIO(pdf_bytes))
+    except Exception as err:
+        raise RuntimeError(f"PDF extraction failed: {err}") from err
 
-if CommandLine.arguments.count < 2 {
-    fputs("Usage: extract_pdf_text <pdf-path>\\n", stderr)
-    exit(1)
-}
-let path = CommandLine.arguments[1]
-let url = URL(fileURLWithPath: path)
-
-if let doc = PDFDocument(url: url) {
-    for i in 0..<doc.pageCount {
-        if let page = doc.page(at: i), let text = page.string {
-            print("===PAGE \\(i+1)===")
-            print(text)
-        }
-    }
-} else {
-    fputs("Could not open PDF\\n", stderr)
-    exit(2)
-}
-""".strip()
-        )
-        proc = subprocess.run(
-            [
-                "swift",
-                "-module-cache-path",
-                "/tmp/swift-module-cache",
-                str(swift_path),
-                str(pdf_path),
-            ],
-            capture_output=True,
-            text=True,
-            check=False,
-        )
-        if proc.returncode != 0:
-            stderr = (proc.stderr or "").strip()
-            raise RuntimeError(f"PDF extraction failed: {stderr}")
-        return proc.stdout
+    pages: List[str] = []
+    for idx, page in enumerate(reader.pages, start=1):
+        try:
+            text = page.extract_text() or ""
+        except Exception:
+            text = ""
+        if text.strip():
+            pages.append(f"===PAGE {idx}===\n{text}")
+    return "\n".join(pages)
 
 
 def clean_inline_whitespace(value: str) -> str:
@@ -1547,8 +1517,8 @@ class AppHandler(BaseHTTPRequestHandler):
 
 
 def run() -> None:
-    host = "127.0.0.1"
-    port = 8080
+    host = os.getenv("HOST", "0.0.0.0")
+    port = int(os.getenv("PORT", "8080"))
     server = ThreadingHTTPServer((host, port), AppHandler)
     print(f"Hotel Polaris Space Suggester running at http://{host}:{port}")
     server.serve_forever()
