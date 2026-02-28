@@ -6,6 +6,7 @@ import math
 import os
 import re
 import html
+import traceback
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple
@@ -1337,9 +1338,18 @@ def html_template() -> str:
           body: formData,
         });
 
-        const data = await res.json();
+        const rawBody = await res.text();
+        let data = {};
+        if (rawBody) {
+          try {
+            data = JSON.parse(rawBody);
+          } catch {
+            data = { rawBody };
+          }
+        }
         if (!res.ok) {
-          throw new Error(data.error || "Upload failed");
+          const bodySnippet = (data.rawBody || "").slice(0, 180);
+          throw new Error(data.error || `Upload failed (HTTP ${res.status}) ${bodySnippet}`);
         }
 
         statusEl.textContent = "Done. Recommendations generated.";
@@ -1366,6 +1376,9 @@ def html_template() -> str:
 
 
 class AppHandler(BaseHTTPRequestHandler):
+    def _log(self, message: str) -> None:
+        print(f"[{dt.datetime.now().isoformat()}] {message}", flush=True)
+
     def _multipart_fields(self) -> Dict[str, Dict[str, Any]]:
         content_type = self.headers.get("Content-Type", "")
         content_length = int(self.headers.get("Content-Length", "0") or "0")
@@ -1481,79 +1494,90 @@ class AppHandler(BaseHTTPRequestHandler):
         self._json({"error": "Not found"}, status=404)
 
     def do_POST(self) -> None:
-        parsed = urlparse(self.path)
-        if parsed.path != "/api/parse-rfp":
-            self._json({"error": "Not found"}, status=404)
-            return
-
-        if "multipart/form-data" not in (self.headers.get("Content-Type", "")):
-            self._json({"error": "Expected multipart/form-data"}, status=400)
-            return
-
-        fields = self._multipart_fields()
-        if not fields:
-            self._json({"error": "Invalid multipart/form-data payload"}, status=400)
-            return
-
-        filefield = fields.get("rfp")
-        if filefield is None:
-            self._json({"error": "Missing RFP file upload"}, status=400)
-            return
-        diaryfield = fields.get("diary")
-
-        pdf_bytes = filefield.get("data", b"")
-        if not pdf_bytes:
-            self._json({"error": "Uploaded file was empty"}, status=400)
-            return
-
         try:
-            text = extract_pdf_text(pdf_bytes)
-        except RuntimeError as err:
-            self._json({"error": str(err)}, status=500)
-            return
+            parsed = urlparse(self.path)
+            if parsed.path != "/api/parse-rfp":
+                self._json({"error": "Not found"}, status=404)
+                return
 
-        if not looks_like_cvent_rfp(text):
-            self._json(
-                {
-                    "error": "This does not look like a Cvent RFP format. Phase 1 is limited to Cvent templates.",
-                },
-                status=400,
+            self._log(
+                "POST /api/parse-rfp "
+                f"content-type={self.headers.get('Content-Type', '')} "
+                f"content-length={self.headers.get('Content-Length', '')}"
             )
-            return
 
-        diary_entries: List[Dict[str, Any]] = []
-        if diaryfield is not None:
-            diary_bytes = diaryfield.get("data", b"")
-            if diary_bytes:
-                try:
-                    diary_entries = parse_diary_upload(diary_bytes, diaryfield.get("filename", ""))
-                except RuntimeError:
-                    diary_entries = []
+            if "multipart/form-data" not in (self.headers.get("Content-Type", "")):
+                self._json({"error": "Expected multipart/form-data"}, status=400)
+                return
 
-        header = parse_rfp_header(text)
-        requirements = parse_meeting_requirements(text, header=header)
-        same_rfp_tokens = [
-            (header.get("rfp_name") or "").lower(),
-            (header.get("organization_name") or "").lower(),
-        ]
-        recommendations = build_recommendations(
-            requirements,
-            diary_entries=diary_entries,
-            same_rfp_tokens=same_rfp_tokens,
-        )
-        food_beverage = calculate_food_beverage(requirements)
-        global LAST_REPORT
-        LAST_REPORT = {
-            "header": header,
-            "requirements_count": len(requirements),
-            "recommendations": recommendations,
-            "food_beverage": food_beverage,
-            "diary_entries_parsed": len(diary_entries),
-        }
+            fields = self._multipart_fields()
+            if not fields:
+                self._json({"error": "Invalid multipart/form-data payload"}, status=400)
+                return
 
-        self._json(
-            LAST_REPORT
-        )
+            filefield = fields.get("rfp")
+            if filefield is None:
+                self._json({"error": "Missing RFP file upload"}, status=400)
+                return
+            diaryfield = fields.get("diary")
+
+            pdf_bytes = filefield.get("data", b"")
+            if not pdf_bytes:
+                self._json({"error": "Uploaded file was empty"}, status=400)
+                return
+
+            try:
+                text = extract_pdf_text(pdf_bytes)
+            except RuntimeError as err:
+                self._json({"error": str(err)}, status=500)
+                return
+
+            if not looks_like_cvent_rfp(text):
+                self._json(
+                    {
+                        "error": "This does not look like a Cvent RFP format. Phase 1 is limited to Cvent templates.",
+                    },
+                    status=400,
+                )
+                return
+
+            diary_entries: List[Dict[str, Any]] = []
+            if diaryfield is not None:
+                diary_bytes = diaryfield.get("data", b"")
+                if diary_bytes:
+                    try:
+                        diary_entries = parse_diary_upload(diary_bytes, diaryfield.get("filename", ""))
+                    except RuntimeError:
+                        diary_entries = []
+
+            header = parse_rfp_header(text)
+            requirements = parse_meeting_requirements(text, header=header)
+            same_rfp_tokens = [
+                (header.get("rfp_name") or "").lower(),
+                (header.get("organization_name") or "").lower(),
+            ]
+            recommendations = build_recommendations(
+                requirements,
+                diary_entries=diary_entries,
+                same_rfp_tokens=same_rfp_tokens,
+            )
+            food_beverage = calculate_food_beverage(requirements)
+            global LAST_REPORT
+            LAST_REPORT = {
+                "header": header,
+                "requirements_count": len(requirements),
+                "recommendations": recommendations,
+                "food_beverage": food_beverage,
+                "diary_entries_parsed": len(diary_entries),
+            }
+
+            self._json(
+                LAST_REPORT
+            )
+        except Exception as err:
+            self._log(f"Unhandled upload exception: {err}")
+            self._log(traceback.format_exc())
+            self._json({"error": f"Server error while processing upload: {err}"}, status=500)
 
 
 def run() -> None:
